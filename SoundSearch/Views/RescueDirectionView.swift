@@ -15,7 +15,7 @@ struct RescueDirectionView: View {
                     ConfidenceArc(
                         confidence: viewModel.confidence,
                         isLocked: viewModel.isLocked,
-                        isSignalDetected: viewModel.confidence > 0.55 && !viewModel.isLocked
+                        isSignalDetected: viewModel.confidence > 0.3 && !viewModel.isLocked
                     )
                         .frame(width: 280, height: 280)
 
@@ -39,18 +39,38 @@ struct RescueDirectionView: View {
 
             if !viewModel.debugInfo.isEmpty {
                 VStack {
-                    HStack {
-                        Text(viewModel.debugInfo)
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.white.opacity(0.7))
-                            .padding(8)
-                            .background(Color.black.opacity(0.4))
-                            .cornerRadius(8)
-                        Spacer()
+                    ScrollView {
+                        HStack {
+                            Text(viewModel.debugInfo)
+                                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.white.opacity(0.7))
+                                .lineLimit(nil)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer()
+                        }
                     }
+                    .frame(maxHeight: 200)
+                    .padding(8)
+                    .background(Color.black.opacity(0.5))
+                    .cornerRadius(8)
                     Spacer()
                 }
                 .padding(12)
+            }
+
+            if let error = viewModel.errorMessage {
+                VStack {
+                    Spacer()
+                    Text(error)
+                        .font(.system(size: 14, weight: .medium, design: .rounded))
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                        .padding()
+                        .background(Color.black.opacity(0.7))
+                        .cornerRadius(12)
+                        .padding(.horizontal, 24)
+                        .padding(.bottom, 40)
+                }
             }
         }
         .preferredColorScheme(.dark)

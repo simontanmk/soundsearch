@@ -20,10 +20,10 @@ final class SensorDirectionEngine: DirectionEngine {
             let simulationTask = Task {
                 while !Task.isCancelled {
                     time += updateInterval
-                    targetBearing = Self.normalizedDegrees(200 + sin(time * 0.22) * 85 + sin(time * 0.07) * 35)
+                    targetBearing = DirectionMath.normalizedDegrees(200 + sin(time * 0.22) * 85 + sin(time * 0.07) * 35)
 
                     let phoneHeading = await headingState.value
-                    let error = Self.shortestAngle(from: phoneHeading, to: targetBearing)
+                    let error = DirectionMath.shortestAngle(from: phoneHeading, to: targetBearing)
                     let alignmentBoost = max(0, 1 - abs(error) / 90)
                     let baseConfidence = 0.25 + 0.45 * (sin(time * 0.45) + 1) / 2
                     var confidence = baseConfidence + alignmentBoost * 0.35 + Double.random(in: -0.03...0.03)
@@ -61,15 +61,6 @@ final class SensorDirectionEngine: DirectionEngine {
         HeadingProvider.isHeadingAvailable()
     }
 
-    private static func normalizedDegrees(_ degrees: Double) -> Double {
-        let wrapped = degrees.truncatingRemainder(dividingBy: 360)
-        return wrapped < 0 ? wrapped + 360 : wrapped
-    }
-
-    private static func shortestAngle(from heading: Double, to target: Double) -> Double {
-        let normalized = normalizedDegrees(target - heading)
-        return normalized > 180 ? normalized - 360 : normalized
-    }
 }
 
 private actor HeadingState {

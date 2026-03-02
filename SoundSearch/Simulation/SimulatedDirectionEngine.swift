@@ -14,10 +14,10 @@ final class SimulatedDirectionEngine: DirectionEngine {
                 while !Task.isCancelled {
                     time += updateInterval
 
-                    phoneHeading = Self.normalizedDegrees(phoneHeading + 12 * updateInterval + sin(time * 0.8) * 0.4)
-                    targetBearing = Self.normalizedDegrees(200 + sin(time * 0.22) * 85 + sin(time * 0.07) * 35)
+                    phoneHeading = DirectionMath.normalizedDegrees(phoneHeading + 12 * updateInterval + sin(time * 0.8) * 0.4)
+                    targetBearing = DirectionMath.normalizedDegrees(200 + sin(time * 0.22) * 85 + sin(time * 0.07) * 35)
 
-                    let error = Self.shortestAngle(from: phoneHeading, to: targetBearing)
+                    let error = DirectionMath.shortestAngle(from: phoneHeading, to: targetBearing)
                     let alignmentBoost = max(0, 1 - abs(error) / 90)
                     let baseConfidence = 0.22 + 0.45 * (sin(time * 0.55) + 1) / 2
                     var confidence = baseConfidence + alignmentBoost * 0.35 + Double.random(in: -0.03...0.03)
@@ -48,16 +48,6 @@ final class SimulatedDirectionEngine: DirectionEngine {
                 task.cancel()
             }
         }
-    }
-
-    private static func normalizedDegrees(_ degrees: Double) -> Double {
-        let wrapped = degrees.truncatingRemainder(dividingBy: 360)
-        return wrapped < 0 ? wrapped + 360 : wrapped
-    }
-
-    private static func shortestAngle(from heading: Double, to target: Double) -> Double {
-        let normalized = normalizedDegrees(target - heading)
-        return normalized > 180 ? normalized - 360 : normalized
     }
 
     // TODO: Replace this simulator with live AVAudioEngine + beamforming/ML output.

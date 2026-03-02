@@ -10,6 +10,8 @@ final class RescueDirectionViewModel: ObservableObject {
     @Published private(set) var angularError: Double = 0
     @Published private(set) var showLockConfirmation: Bool = false
     @Published private(set) var debugInfo: String = ""
+    @Published private(set) var errorMessage: String?
+    @Published private(set) var isStereoMode: Bool = false
 
     // TODO: Replace simulated target/confidence with live AVAudioEngine/beamforming/ML source.
     private let engine: DirectionEngine
@@ -33,10 +35,17 @@ final class RescueDirectionViewModel: ObservableObject {
                 return
             }
             Task { @MainActor [weak self] in
-                self?.debugInfo = summary
+                guard let self else { return }
+                self.debugLines.append(summary)
+                // Keep last 20 lines
+                if self.debugLines.count > 20 {
+                    self.debugLines.removeFirst(self.debugLines.count - 20)
+                }
+                self.debugInfo = self.debugLines.joined(separator: "\n")
             }
         }
     }
+    private var debugLines: [String] = []
     private let haptics = HapticsManager()
     private var simulationTask: Task<Void, Never>?
     private var filteredError: Double = 0
@@ -45,6 +54,9 @@ final class RescueDirectionViewModel: ObservableObject {
     private var lockHoldUntil: Date?
 
     deinit {
+        simulationTask?.cancel()
+        simulationTask = nil
+        haptics.stop()
         if let debugObserver {
             NotificationCenter.default.removeObserver(debugObserver)
         }
@@ -59,19 +71,34 @@ final class RescueDirectionViewModel: ObservableObject {
             return ""
         }
         if isLocked {
-            return "Locked"
+            return "Direction locked"
         }
-        if confidence > 0.55 {
-            return "Signal detected"
+        if isStereoMode {
+            // Stereo mode — no rotation needed
+            if confidence > 0.3 {
+                return "Tracking sound source"
+            }
+            return "Listening for sounds…"
+        } else {
+            // Mono mode — rotation required
+            if confidence > 0.3 {
+                return "Source detected — keep rotating"
+            }
+            return "Hold upright, rotate slowly"
         }
-        return "Listening..."
     }
 
     func start() {
         stop()
+        errorMessage = nil
         simulationTask = Task {
+            var receivedSample = false
             for await sample in engine.stream() {
+                receivedSample = true
                 apply(sample)
+            }
+            if !receivedSample {
+                errorMessage = "Unable to start audio direction. Check microphone permissions and ensure no Bluetooth audio devices are connected."
             }
         }
     }
@@ -86,8 +113,9 @@ final class RescueDirectionViewModel: ObservableObject {
         phoneHeading = sample.phoneHeading
         targetBearing = sample.targetBearing
         isLocked = sample.isLocked
+        isStereoMode = sample.isStereoMode
 
-        let rawError = Self.shortestAngle(from: sample.phoneHeading, to: sample.targetBearing)
+        let rawError = DirectionMath.shortestAngle(from: sample.phoneHeading, to: sample.targetBearing)
         let errorSmoothing = 0.18
         filteredError += (rawError - filteredError) * errorSmoothing
         angularError = filteredError
@@ -116,13 +144,4 @@ final class RescueDirectionViewModel: ObservableObject {
         lastLockState = isLocked
     }
 
-    private static func shortestAngle(from heading: Double, to target: Double) -> Double {
-        let normalized = normalizedDegrees(target - heading)
-        return normalized > 180 ? normalized - 360 : normalized
-    }
-
-    private static func normalizedDegrees(_ degrees: Double) -> Double {
-        let wrapped = degrees.truncatingRemainder(dividingBy: 360)
-        return wrapped < 0 ? wrapped + 360 : wrapped
-    }
 }

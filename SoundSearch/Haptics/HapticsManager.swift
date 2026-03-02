@@ -15,8 +15,13 @@ final class HapticsManager {
         supportsHaptics = CHHapticEngine.capabilitiesForHardware().supportsHaptics
         if supportsHaptics {
             do {
-                engine = try CHHapticEngine()
-                try engine?.start()
+                let eng = try CHHapticEngine()
+                eng.resetHandler = { [weak eng] in
+                    try? eng?.start()
+                }
+                eng.stoppedHandler = { _ in }
+                try eng.start()
+                engine = eng
             } catch {
                 supportsHaptics = false
                 engine = nil
@@ -32,7 +37,7 @@ final class HapticsManager {
         }
         lastLockState = isLocked
 
-        if confidence < 0.35 {
+        if confidence < 0.20 {
             stopPulses()
             return
         }
@@ -116,7 +121,6 @@ final class HapticsManager {
         do {
             let pattern = try CHHapticPattern(events: [event], parameters: [])
             let player = try engine.makePlayer(with: pattern)
-            try engine.start()
             try player.start(atTime: 0)
         } catch {
             fallbackGenerator.impactOccurred()
