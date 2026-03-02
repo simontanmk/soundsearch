@@ -9,9 +9,11 @@ final class RescueDirectionViewModel: ObservableObject {
     @Published private(set) var isLocked: Bool = false
     @Published private(set) var angularError: Double = 0
     @Published private(set) var showLockConfirmation: Bool = false
+    @Published private(set) var debugInfo: String = ""
 
     // TODO: Replace simulated target/confidence with live AVAudioEngine/beamforming/ML source.
     private let engine: DirectionEngine
+    private var debugObserver: NSObjectProtocol?
 
     init() {
         if AudioDirectionEngine.isSupported() {
@@ -21,6 +23,19 @@ final class RescueDirectionViewModel: ObservableObject {
         } else {
             engine = SimulatedDirectionEngine()
         }
+
+        debugObserver = NotificationCenter.default.addObserver(
+            forName: AudioDirectionEngine.debugNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let summary = note.userInfo?["summary"] as? String else {
+                return
+            }
+            Task { @MainActor [weak self] in
+                self?.debugInfo = summary
+            }
+        }
     }
     private let haptics = HapticsManager()
     private var simulationTask: Task<Void, Never>?
@@ -28,6 +43,12 @@ final class RescueDirectionViewModel: ObservableObject {
     private var filteredConfidence: Double = 0
     private var lastLockState: Bool = false
     private var lockHoldUntil: Date?
+
+    deinit {
+        if let debugObserver {
+            NotificationCenter.default.removeObserver(debugObserver)
+        }
+    }
 
     var arrowRotation: Double {
         angularError

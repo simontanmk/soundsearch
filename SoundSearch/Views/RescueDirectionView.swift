@@ -36,6 +36,22 @@ struct RescueDirectionView: View {
                 LockConfirmationView()
                     .transition(.opacity)
             }
+
+            if !viewModel.debugInfo.isEmpty {
+                VStack {
+                    HStack {
+                        Text(viewModel.debugInfo)
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.7))
+                            .padding(8)
+                            .background(Color.black.opacity(0.4))
+                            .cornerRadius(8)
+                        Spacer()
+                    }
+                    Spacer()
+                }
+                .padding(12)
+            }
         }
         .preferredColorScheme(.dark)
         .onAppear {
