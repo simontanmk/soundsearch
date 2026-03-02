@@ -4,3 +4,4 @@ build/
 *.xcworkspace/xcuserdata/
 *.xcuserdatad/
 *.xcuserstate
+hardware.md
