@@ -1,0 +1,3 @@
+[submodule "mlmodel"]
+	path = mlmodel
+	url = https://github.com/cshuaa/audio-event-detection.git
