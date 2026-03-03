@@ -20,6 +20,9 @@ final class RescueDirectionViewModel: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var isStereoMode: Bool = false
 
+    /// Flip to `true` when you need on-screen diagnostic logs.
+    static let showDebugLog = false
+
     // TODO: Replace simulated target/confidence with live AVAudioEngine/beamforming/ML source.
     private let engine: DirectionEngine
     private var debugObserver: NSObjectProtocol?
@@ -33,6 +36,8 @@ final class RescueDirectionViewModel: ObservableObject {
         } else {
             engine = SimulatedDirectionEngine()
         }
+
+        guard Self.showDebugLog else { return }
 
         debugObserver = NotificationCenter.default.addObserver(
             forName: AudioDirectionEngine.debugNotification,

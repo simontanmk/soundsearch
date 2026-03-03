@@ -17,7 +17,7 @@ struct RescueDirectionView: View {
                 .animation(.easeInOut(duration: 0.25), value: viewModel.showLockConfirmation)
 
             // ── Debug overlay (top) ─────────────────────────
-            if !viewModel.debugInfo.isEmpty {
+            if RescueDirectionViewModel.showDebugLog && !viewModel.debugInfo.isEmpty {
                 debugOverlay
             }
 
