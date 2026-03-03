@@ -2,7 +2,7 @@
 
 **Detect distress sounds that would not be picked up by the normal ears in a noisy enviornment like the aftermath of an earthquke. Locate their direction. Guide untrained civilians for the fastest help possible in a dangerous pile of platic, cement, glass and dust filled rubble.**
 
-SoundSearch is an iOS app that listens for distress sounds — the softer ones such as a tap, whisper of "help" or knocking sounds and more  — using the coreML technlogy to amplify these sounds, then uses the iPhone's microphones to estimate the direction the sound is coming from. A Find My–style UI with a directional arrow, particle ring, proximity feedback, and haptics guides the user toward the civilians one by one, making scouring for a civilian under a rubble safer. We were inspired by (Ukraine's Sky fortress) [https://united24media.com/war-in-ukraine/sky-fortress-ukraines-acoustic-detection-system-that-tracks-drones-cheap-and-fast-9451] and wanted to bring this technoloy down to our mobile phones. 
+SoundSearch is an iOS app that listens for distress sounds — the softer ones such as a tap, whisper of "help" or knocking sounds and more  — using the coreML technlogy to amplify these sounds, then uses the iPhone's microphones to estimate the direction the sound is coming from. A Find My–style UI with a directional arrow, particle ring, proximity feedback, and haptics guides the user toward the civilians one by one, making scouring for a civilian under a rubble safer. We were inspired by Ukraine's Sky fortress [https://united24media.com/war-in-ukraine/sky-fortress-ukraines-acoustic-detection-system-that-tracks-drones-cheap-and-fast-9451] and wanted to bring this technoloy down to our mobile phones. 
 
 ---
 
