@@ -3,6 +3,13 @@ import Combine
 
 @MainActor
 final class RescueDirectionViewModel: ObservableObject {
+    // ── Phase ───────────────────────────────────────────────
+    @Published private(set) var phase: AppPhase = .detecting
+    @Published private(set) var distressConfidence: Double = 0
+    @Published private(set) var bufferProgress: Double = 0
+    @Published private(set) var isDistressConfirmed: Bool = false
+
+    // ── Direction ───────────────────────────────────────────
     @Published private(set) var phoneHeading: Double = 0
     @Published private(set) var targetBearing: Double = 0
     @Published private(set) var confidence: Double = 0
@@ -16,6 +23,7 @@ final class RescueDirectionViewModel: ObservableObject {
     // TODO: Replace simulated target/confidence with live AVAudioEngine/beamforming/ML source.
     private let engine: DirectionEngine
     private var debugObserver: NSObjectProtocol?
+    private var classifierDebugObserver: NSObjectProtocol?
 
     init() {
         if AudioDirectionEngine.isSupported() {
@@ -36,12 +44,21 @@ final class RescueDirectionViewModel: ObservableObject {
             }
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.debugLines.append(summary)
-                // Keep last 20 lines
-                if self.debugLines.count > 20 {
-                    self.debugLines.removeFirst(self.debugLines.count - 20)
-                }
-                self.debugInfo = self.debugLines.joined(separator: "\n")
+                self.appendDebugLine(summary)
+            }
+        }
+
+        classifierDebugObserver = NotificationCenter.default.addObserver(
+            forName: DistressClassifier.debugNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let summary = note.userInfo?["summary"] as? String else {
+                return
+            }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.appendDebugLine(summary)
             }
         }
     }
@@ -60,6 +77,17 @@ final class RescueDirectionViewModel: ObservableObject {
         if let debugObserver {
             NotificationCenter.default.removeObserver(debugObserver)
         }
+        if let classifierDebugObserver {
+            NotificationCenter.default.removeObserver(classifierDebugObserver)
+        }
+    }
+
+    private func appendDebugLine(_ line: String) {
+        debugLines.append(line)
+        if debugLines.count > 20 {
+            debugLines.removeFirst(debugLines.count - 20)
+        }
+        debugInfo = debugLines.joined(separator: "\n")
     }
 
     var arrowRotation: Double {
@@ -67,6 +95,18 @@ final class RescueDirectionViewModel: ObservableObject {
     }
 
     var statusText: String {
+        // ── Detection phase ─────────────────────────────────
+        if phase == .detecting {
+            if bufferProgress < 1.0 {
+                return "Listening for distress sounds…"
+            }
+            if distressConfidence > 0.3 {
+                return String(format: "Analyzing… %.0f%% confidence", distressConfidence * 100)
+            }
+            return "Listening for distress sounds…"
+        }
+
+        // ── Direction phase ─────────────────────────────────
         if showLockConfirmation {
             return ""
         }
@@ -74,17 +114,15 @@ final class RescueDirectionViewModel: ObservableObject {
             return "Direction locked"
         }
         if isStereoMode {
-            // Stereo mode — no rotation needed
             if confidence > 0.3 {
                 return "Tracking sound source"
             }
-            return "Listening for sounds…"
+            return "Distress detected — locating source…"
         } else {
-            // Mono mode — rotation required
             if confidence > 0.3 {
                 return "Source detected — keep rotating"
             }
-            return "Hold upright, rotate slowly"
+            return "Distress detected — rotate slowly"
         }
     }
 
@@ -110,10 +148,23 @@ final class RescueDirectionViewModel: ObservableObject {
     }
 
     private func apply(_ sample: DirectionSample) {
+        phase = sample.phase
+        isStereoMode = sample.isStereoMode
+
+        // ── Detection phase ─────────────────────────────────
+        if sample.phase == .detecting {
+            distressConfidence = sample.distressConfidence
+            bufferProgress = sample.bufferProgress
+            isDistressConfirmed = sample.isDistressConfirmed
+            // Don't update direction fields during detection
+            return
+        }
+
+        // ── Direction phase ─────────────────────────────────
+        isDistressConfirmed = true
         phoneHeading = sample.phoneHeading
         targetBearing = sample.targetBearing
         isLocked = sample.isLocked
-        isStereoMode = sample.isStereoMode
 
         let rawError = DirectionMath.shortestAngle(from: sample.phoneHeading, to: sample.targetBearing)
         let errorSmoothing = 0.18

@@ -33,6 +33,8 @@ final class SimulatedDirectionEngine: DirectionEngine {
 
                     continuation.yield(
                         DirectionSample(
+                            phase: .directing,
+                            isDistressConfirmed: true,
                             phoneHeading: phoneHeading,
                             targetBearing: targetBearing,
                             confidence: confidence,

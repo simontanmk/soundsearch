@@ -6,17 +6,17 @@ import Accelerate
 // MARK: - AudioDirectionEngine
 // ═══════════════════════════════════════════════════════════════
 //
-//  Two-mode direction-of-arrival:
+//  Two-phase audio pipeline:
 //
-//    • STEREO (preferred): GCC-PHAT cross-correlation + ILD fusion
-//      between L/R channels → instant direction, no rotation needed.
-//      GCC-PHAT provides fine angular resolution (≈5°) in the
-//      300–2400 Hz band; ILD covers higher frequencies.
-//      Enabled via .videoRecording or .default session mode if
-//      device provides 2+ channels.
+//  Phase 1 — DETECTION:
+//    Captures stereo (or mono) audio, mixes to mono, feeds
+//    DistressClassifier.  Yields detection-phase DirectionSamples
+//    with classifier progress/confidence.  No direction tracking.
 //
-//    • MONO (fallback): Front Cardioid in .measurement mode →
-//      rotation-scan.  User sweeps phone to build energy map.
+//  Phase 2 — DIRECTION (after distress confirmed):
+//    Same audio tap switches to GCC-PHAT + ILD (stereo) or
+//    rotation-scan (mono) direction-of-arrival tracking.
+//    Yields direction-phase DirectionSamples with bearing.
 //
 //  Uses Accelerate vDSP FFT for GCC-PHAT (512-point, <0.1 ms).
 
@@ -97,14 +97,6 @@ final class AudioDirectionEngine: DirectionEngine {
         }
 
         // ── 3. Attempt stereo ───────────────────────────────
-        //
-        //  KEY FIX: AVAudioEngine.inputNode caches its format
-        //  from the moment of FIRST ACCESS.  Our tearDown()
-        //  accesses it before session config → it's stuck mono.
-        //
-        //  Solution: configure session FIRST, then create a
-        //  brand-new AVAudioEngine.  The fresh engine's inputNode
-        //  picks up the 2ch session automatically.
 
         var isStereo = false
 
@@ -113,21 +105,13 @@ final class AudioDirectionEngine: DirectionEngine {
             let ch = audioEngine.inputNode.outputFormat(forBus: 0).channelCount
             let sr = audioEngine.inputNode.outputFormat(forBus: 0).sampleRate
             Self.post("STEREO engine: ch=\(ch) sr=\(Int(sr))")
-
             if ch >= 2 {
                 isStereo = true
             } else {
-                Self.post("Engine still mono — full fallback to measurement+cardioid")
+                Self.post("Engine still mono — fallback")
                 try? session.setActive(false, options: .notifyOthersOnDeactivation)
             }
         }
-
-        // ── 4. Mono fallback with CORRECT session ───────────
-        //
-        //  CRITICAL: when stereo fails, reconfigure the session
-        //  to .measurement + Front Cardioid.  Without this the
-        //  mono tracker runs against .videoRecording + .stereo
-        //  polar pattern = wrong AGC = instant false lock.
 
         if !isStereo {
             configureMonoSession()
@@ -137,27 +121,109 @@ final class AudioDirectionEngine: DirectionEngine {
             Self.post("MONO engine: ch=\(ch) sr=\(Int(sr))")
         }
 
-        // ── 5. Install tap ──────────────────────────────────
+        // ── 4. Install tap (two-phase) ──────────────────────
+        //
+        //  Phase 1: Feed mono audio to DistressClassifier.
+        //           Yield detection samples (progress, confidence).
+        //  Phase 2: Once distress confirmed, activate direction
+        //           trackers.  Yield direction samples (bearing).
 
         let node = audioEngine.inputNode
         node.removeTap(onBus: 0)
 
+        let classifier    = DistressClassifier()
         let stereoTracker = isStereo ? StereoTracker() : nil
         let monoTracker   = isStereo ? nil : MonoScanTracker()
-        let stereoMode = isStereo
+        let stereoMode    = isStereo
+        let bufferNeeded  = classifier.melComputer.inputFramesNeeded
 
+        // Mutable state captured by tap
+        var currentPhase: AppPhase = .detecting
         var frameCount: UInt64 = 0
         var lastYieldTime = CFAbsoluteTimeGetCurrent()
         let yieldInterval = 1.0 / 20.0
 
         node.installTap(
-            onBus: 0, bufferSize: 1024, format: nil
+            onBus: 0, bufferSize: 4096, format: nil
         ) { buf, _ in
             let now = CFAbsoluteTimeGetCurrent()
             let heading = headingBox.get()
             let len = Int(buf.frameLength)
-            guard len > 0 else { return }
+            guard len > 0, let ch0 = buf.floatChannelData?[0] else { return }
 
+            // ═══════════════════════════════════════════════════
+            // PHASE 1: DETECTION
+            // ═══════════════════════════════════════════════════
+            if currentPhase == .detecting {
+
+                // Mix to mono if stereo (L+R)/2, else just use ch0
+                var result: DistressClassifier.ClassificationResult?
+
+                if stereoMode, let ch1 = buf.floatChannelData?[1] {
+                    var mixed = [Float](repeating: 0, count: len)
+                    vDSP_vadd(ch0, 1, ch1, 1, &mixed, 1, vDSP_Length(len))
+                    var half: Float = 0.5
+                    vDSP_vsmul(mixed, 1, &half, &mixed, 1, vDSP_Length(len))
+                    result = mixed.withUnsafeBufferPointer { ptr in
+                        classifier.feedAudio(ptr.baseAddress!, count: len)
+                    }
+                } else {
+                    result = classifier.feedAudio(ch0, count: len)
+                }
+
+                // Yield detection progress
+                if now - lastYieldTime >= yieldInterval {
+                    lastYieldTime = now
+
+                    let progress = Double(classifier.audioBufferCount) / Double(bufferNeeded)
+
+                    if let result {
+                        continuation.yield(DirectionSample(
+                            phase: .detecting,
+                            distressConfidence: result.distressProb,
+                            bufferProgress: 1.0,
+                            isDistressConfirmed: result.isDistress,
+                            phoneHeading: heading,
+                            targetBearing: 0,
+                            confidence: 0,
+                            isLocked: false,
+                            isStereoMode: stereoMode
+                        ))
+
+                        // Transition to direction phase!
+                        if result.isDistress {
+                            currentPhase = .directing
+                            classifier.reset()
+                            Self.post("═══ DISTRESS CONFIRMED — switching to DIRECTION mode ═══")
+                        }
+                    } else {
+                        continuation.yield(DirectionSample(
+                            phase: .detecting,
+                            distressConfidence: 0,
+                            bufferProgress: min(progress, 1.0),
+                            isDistressConfirmed: false,
+                            phoneHeading: heading,
+                            targetBearing: 0,
+                            confidence: 0,
+                            isLocked: false,
+                            isStereoMode: stereoMode
+                        ))
+                    }
+                }
+
+                frameCount += 1
+                if frameCount % 80 == 0 {
+                    let progress = Double(classifier.audioBufferCount) / Double(bufferNeeded)
+                    Self.post(String(format: "DETECT  buf %.0f%%  %@",
+                                     progress * 100,
+                                     stereoMode ? "stereo→mono" : "mono"))
+                }
+                return
+            }
+
+            // ═══════════════════════════════════════════════════
+            // PHASE 2: DIRECTION
+            // ═══════════════════════════════════════════════════
             if stereoMode, let tracker = stereoTracker {
                 guard let L = buf.floatChannelData?[0],
                       let R = buf.floatChannelData?[1] else { return }
@@ -170,6 +236,8 @@ final class AudioDirectionEngine: DirectionEngine {
                 if now - lastYieldTime >= yieldInterval {
                     lastYieldTime = now
                     continuation.yield(DirectionSample(
+                        phase: .directing,
+                        isDistressConfirmed: true,
                         phoneHeading:  heading,
                         targetBearing: result.bearing,
                         confidence:    result.confidence,
@@ -180,18 +248,26 @@ final class AudioDirectionEngine: DirectionEngine {
 
                 frameCount += 1
                 if frameCount % 40 == 0 {
+                    let voice = result.rmsL > 0.012 || result.rmsR > 0.012
                     Self.post(String(
-                        format: "STEREO  hdg %.0f°  brg %.0f°  tdoa %.2f  ild %.1fdB  gccConf %.2f  conf %.2f",
-                        heading, result.bearing, result.tdoa, result.ild,
-                        result.gccPeak, result.confidence
+                        format: "STEREO brg %.0f° gcc∠%.0f° ild∠%.0f° fuse∠%.0f° tdR %.2f tdC %.2f pk %.2f conf %.2f L %.4f R %.4f %@",
+                        result.bearing,
+                        result.gccAngle,
+                        result.ildAngle,
+                        result.fusedAngle,
+                        result.tdoaRaw,
+                        result.tdoa,
+                        result.gccPeak,
+                        result.confidence,
+                        result.rmsL,
+                        result.rmsR,
+                        voice ? "VOICE" : "quiet"
                     ))
                 }
 
             } else if let tracker = monoTracker {
-                guard let ptr = buf.floatChannelData?[0] else { return }
-
                 var rms: Float = 0
-                vDSP_rmsqv(ptr, 1, &rms, vDSP_Length(len))
+                vDSP_rmsqv(ch0, 1, &rms, vDSP_Length(len))
                 rms *= 10.0
                 let db = Double(20 * log10f(max(rms, 1e-10)))
 
@@ -200,6 +276,8 @@ final class AudioDirectionEngine: DirectionEngine {
                 if now - lastYieldTime >= yieldInterval {
                     lastYieldTime = now
                     continuation.yield(DirectionSample(
+                        phase: .directing,
+                        isDistressConfirmed: true,
                         phoneHeading:  heading,
                         targetBearing: result.bearing,
                         confidence:    result.confidence,
@@ -219,14 +297,14 @@ final class AudioDirectionEngine: DirectionEngine {
             }
         }
 
-        // ── 6. Cleanup ─────────────────────────────────────
+        // ── 5. Cleanup ─────────────────────────────────────
 
         continuation.onTermination = { [weak self] _ in
             headingTask.cancel()
             self?.tearDown()
         }
 
-        // ── 7. Start ────────────────────────────────────────
+        // ── 6. Start ────────────────────────────────────────
 
         do {
             try audioEngine.start()
@@ -237,13 +315,13 @@ final class AudioDirectionEngine: DirectionEngine {
             return
         }
 
-        // ── 8. Post-start info ──────────────────────────────
+        // ── 7. Post-start info ──────────────────────────────
 
         let routeFmt = node.outputFormat(forBus: 0)
         let inp = session.currentRoute.inputs.first
         let ds  = inp?.selectedDataSource?.dataSourceName ?? "—"
         let pp  = inp?.selectedDataSource?.selectedPolarPattern?.rawValue ?? "—"
-        Self.post("RUN \(isStereo ? "STEREO" : "MONO") ch=\(routeFmt.channelCount) sr=\(Int(routeFmt.sampleRate)) ds=\(ds) pp=\(pp)")
+        Self.post("PHASE 1: DETECTING — \(isStereo ? "STEREO" : "MONO") ch=\(routeFmt.channelCount) sr=\(Int(routeFmt.sampleRate)) ds=\(ds) pp=\(pp)")
     }
 
     // ─────────────────────────────────────────────────────────
@@ -447,40 +525,38 @@ private final class StereoTracker: @unchecked Sendable {
         let confidence: Double
         let isLocked:   Bool
         let ild:        Double
-        let tdoa:       Double  // in fractional samples
+        let tdoa:       Double  // in fractional samples (bias-corrected)
         let gccPeak:    Double  // peak height (0–1 quality)
+        let rmsL:       Float   // raw left-channel RMS
+        let rmsR:       Float   // raw right-channel RMS
+        let gccAngle:   Double  // raw GCC-derived angle (degrees)
+        let ildAngle:   Double  // raw ILD-derived angle (degrees)
+        let fusedAngle: Double  // fused angle (degrees, + = right)
+        let tdoaRaw:    Double  // TDOA before bias removal
     }
 
     // ── Physical constants ───────────────────────────────────
     private let micSpacing: Double = 0.063  // ~6.3 cm for iPhone 16 Pro Max
     private let speedOfSound: Double = 343.0
 
-    // ── FFT setup (512-point) ────────────────────────────────
-    private let fftOrder: vDSP_Length = 9        // 2^9 = 512
-    private let fftSize = 512
-    private let fftSetup: FFTSetup
+    // ── Cross-correlation setup ──────────────────────────────
+    private let corrSize = 512   // samples to use for correlation
+    private let searchRadius = 12 // ±12 lags
 
-    // Pre-allocated buffers (avoid alloc in audio callback)
-    private var windowBuf: [Float]
-    private var leftBuf:   [Float]
-    private var rightBuf:  [Float]
-    private var fftRealL:  [Float]
-    private var fftImagL:  [Float]
-    private var fftRealR:  [Float]
-    private var fftImagR:  [Float]
-    private var crossReal: [Float]
-    private var crossImag: [Float]
-    private var corrBuf:   [Float]
+    // Pre-allocated buffers
+    private var diffL: [Float]   // differentiated (high-passed) left
+    private var diffR: [Float]   // differentiated (high-passed) right
 
     // ── Tuning ──────────────────────────────────────────────
-    private let ildScale:       Double = 15.0   // degrees per dB of ILD
+    private let ildScale:       Double = 18.0   // degrees per dB of ILD
     private let maxAngle:       Double = 90.0
-    private let noiseFloor:     Float  = 0.0001 // RMS below = silence
-    private let gccWeight:      Double = 0.7    // GCC contribution to fused angle
-    private let ildWeight:      Double = 0.3    // ILD contribution
+    private let noiseFloor:     Float  = 0.0001 // RMS below = dead silence
+    private let voiceFloor:     Float  = 0.012  // RMS below = ambient noise (no voice)
+    private let gccWeight:      Double = 0.15   // GCC contribution (secondary — hardware delay issue)
+    private let ildWeight:      Double = 0.85   // ILD contribution (primary — clearly tracks direction)
     private let lockThreshold:  Double = 0.40
     private let lockDuration:   Double = 0.8
-    private let gccMinPeak:     Double = 0.05   // below = unreliable GCC
+    private let gccMinPeak:     Double = 0.25   // quality must be genuinely good
 
     // ── State ────────────────────────────────────────────────
     private var sampleRate:    Double = 48000
@@ -490,28 +566,21 @@ private final class StereoTracker: @unchecked Sendable {
     private var smoothTdoa:    Double = 0
     private var lockStreak:    Double = 0
     private var prevTime = CFAbsoluteTimeGetCurrent()
-    private var maxTdoaSamples: Double = 0 // computed from sampleRate
+    private var maxTdoaSamples: Double = 0
+
+    // ── Auto bias calibration (EMA) ──────────────────────────
+    //  Hardware/DSP may have a fixed TDOA offset between channels.
+    //  We estimate it from quiet (non-voice) frames via exponential
+    //  moving average and subtract from voice TDOA.
+    private var tdoaBias:       Double = 0
+    private var biasCount:      Int    = 0
+    private let biasWarmup:     Int    = 10  // frames before bias is valid
+    private let biasAlpha:      Double = 0.05 // EMA smoothing for bias
+    private var biasReady:      Bool   = false
 
     init() {
-        fftSetup  = vDSP_create_fftsetup(9, FFTRadix(kFFTRadix2))!
-
-        windowBuf = [Float](repeating: 0, count: 512)
-        leftBuf   = [Float](repeating: 0, count: 512)
-        rightBuf  = [Float](repeating: 0, count: 512)
-        fftRealL  = [Float](repeating: 0, count: 256)
-        fftImagL  = [Float](repeating: 0, count: 256)
-        fftRealR  = [Float](repeating: 0, count: 256)
-        fftImagR  = [Float](repeating: 0, count: 256)
-        crossReal = [Float](repeating: 0, count: 256)
-        crossImag = [Float](repeating: 0, count: 256)
-        corrBuf   = [Float](repeating: 0, count: 512)
-
-        // Hann window
-        vDSP_hann_window(&windowBuf, vDSP_Length(512), Int32(vDSP_HANN_NORM))
-    }
-
-    deinit {
-        vDSP_destroy_fftsetup(fftSetup)
+        diffL = [Float](repeating: 0, count: corrSize)
+        diffR = [Float](repeating: 0, count: corrSize)
     }
 
     // ── Main entry: called from audio tap ────────────────────
@@ -525,48 +594,82 @@ private final class StereoTracker: @unchecked Sendable {
         let dt  = min(now - prevTime, 0.1)
         prevTime = now
 
-        let n = min(frameCount, fftSize)
+        let n = min(frameCount, corrSize)
 
-        // ── RMS for ILD + silence detection ─────────────────
+        // ── RMS for ILD + silence/voice detection ───────────
         var rmsL: Float = 0, rmsR: Float = 0
         vDSP_rmsqv(left,  1, &rmsL, vDSP_Length(n))
         vDSP_rmsqv(right, 1, &rmsR, vDSP_Length(n))
         let level = max(rmsL, rmsR)
-        let isSilent = level < noiseFloor
+        let hasVoice = level >= voiceFloor
 
         // ── ILD ─────────────────────────────────────────────
         var ild: Double = 0
-        if !isSilent && rmsL > 1e-10 && rmsR > 1e-10 {
-            ild = 20.0 * Double(log10f(rmsR / rmsL))
+        if hasVoice && rmsL > 1e-10 && rmsR > 1e-10 {
+            // Negated: iPhone stereo mic layout maps L-channel to phone's right
+            ild = 20.0 * Double(log10f(rmsL / rmsR))
         }
-        smoothIld += (ild - smoothIld) * (isSilent ? 0.02 : 0.35)
+        if hasVoice {
+            smoothIld += (ild - smoothIld) * 0.35
+        }
         let ildAngle = max(-maxAngle, min(maxAngle, smoothIld * ildScale))
 
-        // ── GCC-PHAT ────────────────────────────────────────
-        var tdoa:    Double = 0
-        var gccPeak: Double = 0
+        // ── Time-domain cross-correlation ────────────────────
+        //
+        //  1. Differentiate both channels (high-pass: removes DC/rumble)
+        //  2. Normalized cross-correlation for lags ±12
+        //  3. Peak → TDOA in samples
+        //  4. Subtract auto-calibrated bias
+        //  5. TDOA → angle
+        //
+        //  Simple, no FFT, no packed-format bugs.
+
+        var tdoaRaw:  Double = 0
+        var tdoa:     Double = 0
+        var gccPeak:  Double = 0
         var gccAngle: Double = 0
 
-        if !isSilent {
-            let (td, pk) = computeGCCPHAT(left: left, right: right, n: n)
-            tdoa    = td
+        if level > noiseFloor {
+            let (td, pk) = computeCrossCorrelation(left: left, right: right, n: n)
+            tdoaRaw = td
             gccPeak = pk
 
-            // TDOA → angle:  θ = arcsin(τ · c / (d · fs))
+            // ── Auto-bias: EMA from quiet frames ────────────
+            //  Only accumulate when above noise floor (real signal)
+            //  but below voice floor (no directional content).
+            if !hasVoice {
+                biasCount += 1
+                if biasCount <= biasWarmup {
+                    // Seed phase: simple running average
+                    tdoaBias += (td - tdoaBias) / Double(biasCount)
+                } else {
+                    // EMA phase: smooth adaptation
+                    tdoaBias += biasAlpha * (td - tdoaBias)
+                }
+                if biasCount >= biasWarmup {
+                    biasReady = true
+                }
+            }
+
+            // Subtract bias
+            tdoa = td - (biasReady ? tdoaBias : 0)
+
+            // TDOA → angle
             if maxTdoaSamples < 1 {
                 maxTdoaSamples = micSpacing * sampleRate / speedOfSound
             }
             let sinArg = tdoa / maxTdoaSamples
             let clampedSin = max(-1.0, min(1.0, sinArg))
-            gccAngle = asin(clampedSin) * 180.0 / .pi  // degrees
+            // Positive TDOA = left leads = sound from right (iPhone mic layout inverted)
+            gccAngle = asin(clampedSin) * 180.0 / .pi
         }
 
-        smoothTdoa += (tdoa - smoothTdoa) * (isSilent ? 0.02 : 0.30)
+        if hasVoice {
+            smoothTdoa += (tdoa - smoothTdoa) * 0.30
+        }
 
         // ── Fuse GCC + ILD ──────────────────────────────────
-        //  If GCC peak is strong, trust it more.
-        //  If GCC is unreliable (noisy, reverberant), lean on ILD.
-        let gccReliable = gccPeak > gccMinPeak
+        let gccReliable = gccPeak > gccMinPeak && hasVoice
         let wGcc = gccReliable ? gccWeight : 0.1
         let wIld = gccReliable ? ildWeight : 0.9
         let totalW = wGcc + wIld
@@ -576,26 +679,25 @@ private final class StereoTracker: @unchecked Sendable {
 
         // ── Confidence ──────────────────────────────────────
         var rawConf: Double = 0
-        if !isSilent {
+        if hasVoice {
             let levelDb    = 20.0 * Double(log10f(max(level, 1e-10)))
             let signalConf = max(0, min(1, (levelDb + 40) / 30))
-            let dirConf: Double
-            if gccReliable {
-                // GCC peak height is a direct quality measure (0–1)
-                dirConf = min(1, gccPeak * 3.0)
-            } else {
-                dirConf = min(1, abs(smoothIld) / 4.0)
-            }
-            rawConf = signalConf * (0.3 + 0.7 * dirConf)
+            // Direction confidence from ILD magnitude (primary signal)
+            let dirConf = min(1.0, abs(smoothIld) / 3.0)
+            rawConf = signalConf * (0.4 + 0.6 * dirConf)
         }
 
         // ── Smooth bearing + confidence ─────────────────────
         if smoothBearing.isNaN { smoothBearing = rawBearing }
-        let diff = DirectionMath.shortestAngle(from: smoothBearing, to: rawBearing)
-        smoothBearing = DirectionMath.normalizedDegrees(
-            smoothBearing + diff * (isSilent ? 0.01 : 0.25)
-        )
-        smoothConf += (rawConf - smoothConf) * (isSilent ? 0.02 : 0.20)
+        if hasVoice {
+            let diff = DirectionMath.shortestAngle(from: smoothBearing, to: rawBearing)
+            smoothBearing = DirectionMath.normalizedDegrees(
+                smoothBearing + diff * 0.25
+            )
+            smoothConf += (rawConf - smoothConf) * 0.20
+        } else {
+            smoothConf *= 0.97
+        }
 
         // ── Lock ────────────────────────────────────────────
         if smoothConf > lockThreshold {
@@ -610,135 +712,106 @@ private final class StereoTracker: @unchecked Sendable {
             isLocked:   lockStreak > lockDuration,
             ild:        smoothIld,
             tdoa:       smoothTdoa,
-            gccPeak:    gccPeak
+            gccPeak:    gccPeak,
+            rmsL:       rmsL,
+            rmsR:       rmsR,
+            gccAngle:   gccAngle,
+            ildAngle:   ildAngle,
+            fusedAngle: fusedAngle,
+            tdoaRaw:    tdoaRaw
         )
     }
 
-    // ── GCC-PHAT core ───────────────────────────────────────
+    // ── Time-domain cross-correlation ───────────────────────
     //
-    //  1. Window + FFT both channels
-    //  2. Cross-power spectrum:  G = L(f) · R*(f)
-    //  3. PHAT whitening:        Ĝ = G / |G|
-    //  4. IFFT → correlation
-    //  5. Parabolic interpolation around peak → sub-sample TDOA
+    //  Differentiate both channels (acts as ~6 dB/oct high-pass,
+    //  removing DC and low-frequency room noise), then compute
+    //  normalized cross-correlation for lags ±searchRadius.
     //
-    //  All done in-place with pre-allocated buffers.
-    //  512-point FFT → 0.05 ms on A17 Pro.
+    //  Cost: O(N × searchRadius) ≈ 512 × 25 = 12,800 ops.
+    //  Eliminates all FFT packed-format complexity.
 
-    private func computeGCCPHAT(
+    private func computeCrossCorrelation(
         left: UnsafePointer<Float>,
         right: UnsafePointer<Float>,
         n: Int
     ) -> (tdoa: Double, peak: Double) {
 
-        let N = fftSize
-        let halfN = N / 2
+        let N = min(n, corrSize)
+        guard N > 2 else { return (0, 0) }
 
-        // ── Copy + zero-pad + window ────────────────────────
-        let copyLen = min(n, N)
-        leftBuf.withUnsafeMutableBufferPointer { lb in
-            lb.baseAddress!.initialize(repeating: 0, count: N)
-            for i in 0..<copyLen { lb[i] = left[i] * windowBuf[i] }
-        }
-        rightBuf.withUnsafeMutableBufferPointer { rb in
-            rb.baseAddress!.initialize(repeating: 0, count: N)
-            for i in 0..<copyLen { rb[i] = right[i] * windowBuf[i] }
+        // Differentiate (high-pass filter): d[i] = x[i+1] - x[i]
+        let dN = N - 1
+        for i in 0..<dN {
+            diffL[i] = left[i + 1] - left[i]
+            diffR[i] = right[i + 1] - right[i]
         }
 
-        // ── Forward FFT (packed split-complex) ──────────────
-        leftBuf.withUnsafeMutableBufferPointer { lb in
-            var splitL = DSPSplitComplex(
-                realp: &fftRealL, imagp: &fftImagL
-            )
-            lb.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: halfN) { cPtr in
-                vDSP_ctoz(cPtr, 2, &splitL, 1, vDSP_Length(halfN))
-            }
-            vDSP_fft_zrip(fftSetup, &splitL, 1, fftOrder, FFTDirection(kFFTDirection_Forward))
-        }
+        // Normalize each channel by RMS (approximates PHAT whitening)
+        var rmsL: Float = 0, rmsR: Float = 0
+        vDSP_rmsqv(diffL, 1, &rmsL, vDSP_Length(dN))
+        vDSP_rmsqv(diffR, 1, &rmsR, vDSP_Length(dN))
+        let invL = rmsL > 1e-8 ? 1.0 / rmsL : Float(0)
+        let invR = rmsR > 1e-8 ? 1.0 / rmsR : Float(0)
 
-        rightBuf.withUnsafeMutableBufferPointer { rb in
-            var splitR = DSPSplitComplex(
-                realp: &fftRealR, imagp: &fftImagR
-            )
-            rb.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: halfN) { cPtr in
-                vDSP_ctoz(cPtr, 2, &splitR, 1, vDSP_Length(halfN))
-            }
-            vDSP_fft_zrip(fftSetup, &splitR, 1, fftOrder, FFTDirection(kFFTDirection_Forward))
-        }
+        guard invL > 0 && invR > 0 else { return (0, 0) }
 
-        // ── Cross-power spectrum: G = L · conj(R) ───────────
-        //    G_real = Lr·Rr + Li·Ri
-        //    G_imag = Li·Rr - Lr·Ri
-        for i in 0..<halfN {
-            let lr = fftRealL[i], li = fftImagL[i]
-            let rr = fftRealR[i], ri = fftImagR[i]
-            crossReal[i] = lr * rr + li * ri
-            crossImag[i] = li * rr - lr * ri
-        }
-
-        // ── PHAT whitening: Ĝ = G / |G| ────────────────────
-        let epsilon: Float = 1e-10
-        for i in 0..<halfN {
-            let mag = sqrtf(crossReal[i] * crossReal[i] + crossImag[i] * crossImag[i]) + epsilon
-            crossReal[i] /= mag
-            crossImag[i] /= mag
-        }
-
-        // ── Inverse FFT ─────────────────────────────────────
-        var splitC = DSPSplitComplex(
-            realp: &crossReal, imagp: &crossImag
-        )
-        vDSP_fft_zrip(fftSetup, &splitC, 1, fftOrder, FFTDirection(kFFTDirection_Inverse))
-
-        // Unpack split-complex → interleaved real correlation
-        corrBuf.withUnsafeMutableBufferPointer { cb in
-            cb.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: halfN) { cPtr in
-                vDSP_ztoc(&splitC, 1, cPtr, 2, vDSP_Length(halfN))
-            }
-        }
-
-        // Scale (vDSP convention: IFFT result is scaled by N/2)
-        var scale = Float(1.0 / Float(halfN))
-        vDSP_vsmul(corrBuf, 1, &scale, &corrBuf, 1, vDSP_Length(N))
-
-        // ── Find peak within plausible TDOA range ───────────
-        //  Max TDOA ≈ micSpacing / speedOfSound * sampleRate ≈ 9 samples
-        //  Search ±12 samples around lag=0 (wrap-around aware).
-        let searchRadius = 12
-        var bestVal: Float = -1
+        // Cross-correlation for lags in [-searchRadius, +searchRadius]
+        //   corr(τ) = (1/M) Σ diffL[i] × diffR[i + τ]   (normalized)
+        let nLags = 2 * searchRadius + 1
+        var corrValues = [Double](repeating: 0, count: nLags)
+        var bestVal: Double = -1e30
         var bestIdx = 0
 
-        for lag in -searchRadius...searchRadius {
-            let idx = (lag + N) % N
-            let val = corrBuf[idx]
+        for lagIdx in 0..<nLags {
+            let lag = lagIdx - searchRadius  // -12 to +12
+            var sum: Double = 0
+            var count = 0
+            for i in 0..<dN {
+                let j = i + lag
+                if j >= 0 && j < dN {
+                    sum += Double(diffL[i] * invL) * Double(diffR[j] * invR)
+                    count += 1
+                }
+            }
+            let val = count > 0 ? sum / Double(count) : 0
+            corrValues[lagIdx] = val
             if val > bestVal {
                 bestVal = val
-                bestIdx = lag
+                bestIdx = lagIdx
             }
         }
 
-        // ── Parabolic interpolation for sub-sample accuracy ─
-        let prevIdx = (bestIdx - 1 + N) % N
-        let nextIdx = (bestIdx + 1 + N) % N
-        let yPrev = Double(corrBuf[prevIdx])
-        let yCurr = Double(bestVal)
-        let yNext = Double(corrBuf[nextIdx])
-        var fracLag = Double(bestIdx)
-        let denom = yPrev - 2 * yCurr + yNext
-        if abs(denom) > 1e-10 {
-            fracLag += 0.5 * (yPrev - yNext) / denom
+        let bestLag = bestIdx - searchRadius
+
+        // Parabolic interpolation
+        var fracLag = Double(bestLag)
+        if bestIdx > 0 && bestIdx < nLags - 1 {
+            let yP = corrValues[bestIdx - 1]
+            let yC = corrValues[bestIdx]
+            let yN = corrValues[bestIdx + 1]
+            let denom = yP - 2.0 * yC + yN
+            if abs(denom) > 1e-10 {
+                fracLag += 0.5 * (yP - yN) / denom
+            }
         }
 
-        // ── Normalize peak (peak / mean of correlation) ─────
-        var sumAbs: Float = 0
-        for lag in -searchRadius...searchRadius {
-            let idx = (lag + N) % N
-            sumAbs += abs(corrBuf[idx])
+        // Peak quality: ratio of best peak to second-best peak.
+        // A clear directional signal has one dominant peak.
+        // Noise/hardware artifacts have multiple similar peaks.
+        var secondBest: Double = -1e30
+        for lagIdx in 0..<nLags {
+            let val = corrValues[lagIdx]
+            // Must be at least 3 lags away from the best to count as separate peak
+            if abs(lagIdx - bestIdx) >= 3 && val > secondBest {
+                secondBest = val
+            }
         }
-        let meanAbs = Double(sumAbs) / Double(2 * searchRadius + 1)
-        let normPeak = meanAbs > 1e-10 ? Double(bestVal) / meanAbs : 0
+        let ratio = secondBest > 1e-10 ? bestVal / secondBest : (bestVal > 0.01 ? 1.0 : 0.0)
+        // ratio ≈ 1.0–1.2 = ambiguous (noise), ≈ 2+ = clear directional peak
+        let normPeak = min(1.0, max(0, (ratio - 1.0) / 1.5))
 
-        return (tdoa: fracLag, peak: min(normPeak, 1.0))
+        return (tdoa: fracLag, peak: normPeak)
     }
 }
 
